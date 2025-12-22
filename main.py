@@ -38,7 +38,10 @@ class SystemdUserProcessChecker:
     
     def check_current_user(self):
         user_data = []
-        current_user = os.getlogin()
+        try:
+            current_user = os.getlogin()
+        except:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
         user_id = os.getuid()
         
         user_data.append(["Username", current_user])
@@ -69,7 +72,7 @@ class SystemdUserProcessChecker:
         dir_data = []
         
         user_config_dir = os.path.expanduser("~/.config/systemd/user")
-        user_runtime_dir = f"/run/user/{os.getuid()}/systemd"
+        user_runtime_dir = f"/run/user/{os.getuid()}"
         user_local_dir = os.path.expanduser("~/.local/share/systemd/user")
         
         directories = [
@@ -85,13 +88,17 @@ class SystemdUserProcessChecker:
             
             if exists and is_dir:
                 try:
-                    file_count = len([f for f in os.listdir(path) if f.endswith('.service') or f.endswith('.socket') or f.endswith('.timer')])
+                    files = os.listdir(path)
+                    unit_files = [f for f in files if any(f.endswith(ext) for ext in ['.service', '.socket', '.timer'])]
+                    file_count = len(unit_files)
                 except:
                     file_count = -1
             
             status = "Present" if exists else "Missing"
             if file_count > 0:
                 status = f"Present ({file_count} units)"
+            elif file_count == -1:
+                status = "Access Denied"
             
             dir_data.append([name, path, status])
         
@@ -179,7 +186,7 @@ class SystemdUserProcessChecker:
             start_processing = False
             
             for line in lines:
-                if "UNIT" in line and "LOAD" in line and "ACTIVE" in line:
+                if "UNIT" in line and "LOAD" in line and "ACTIVE" in line and "SUB" in line:
                     start_processing = True
                     continue
                 
@@ -202,7 +209,7 @@ class SystemdUserProcessChecker:
         return socket_data
     
     def check_user_timers(self):
-        cmd = "systemctl --user list-timers --no-pager"
+        cmd = "systemctl --user list-timers --all --no-pager"
         output, code = self.run_command(cmd, user_mode=True)
         
         timer_data = []
@@ -218,11 +225,16 @@ class SystemdUserProcessChecker:
                 
                 if start_processing and line.strip() and not line.startswith("timers listed"):
                     parts = line.split(maxsplit=5)
-                    if len(parts) >= 6:
+                    if len(parts) >= 4:
                         timer_name = parts[0]
-                        next_activation = f"{parts[1]} {parts[2]}"
-                        time_left = parts[3]
-                        last_activation = f"{parts[4]} {parts[5]}" if len(parts) > 5 else parts[4]
+                        if len(parts) >= 6:
+                            next_activation = f"{parts[1]} {parts[2]}"
+                            time_left = parts[3]
+                            last_activation = f"{parts[4]} {parts[5]}"
+                        elif len(parts) >= 4:
+                            next_activation = parts[1] if len(parts) > 1 else "N/A"
+                            time_left = parts[2] if len(parts) > 2 else "N/A"
+                            last_activation = parts[3] if len(parts) > 3 else "N/A"
                         timer_data.append([timer_name, next_activation, time_left, last_activation])
         
         self.display_table(
@@ -286,14 +298,21 @@ class SystemdUserProcessChecker:
         
         self.user_info['system_users'] = user_data
         
-        cmd_linger = "loginctl show-user $USER | grep Linger"
-        output_linger, _ = self.run_command(cmd_linger, user_mode=True)
+        try:
+            current_user = os.getlogin()
+        except:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        
+        cmd_linger = f"loginctl show-user {current_user} | grep Linger"
+        output_linger, _ = self.run_command(cmd_linger)
         
         linger_status = "Disabled"
         if "Linger=yes" in output_linger:
             linger_status = "Enabled"
+        elif "Linger=no" in output_linger:
+            linger_status = "Disabled"
         
-        linger_data = [[os.getlogin(), linger_status]]
+        linger_data = [[current_user, linger_status]]
         
         self.display_table(
             "USER LINGER STATUS",
@@ -318,11 +337,11 @@ class SystemdUserProcessChecker:
             scope_count = 0
             
             for line in lines:
-                if ".service" in line:
+                if ".service" in line and "├─" in line:
                     service_count += 1
-                elif ".slice" in line:
+                elif ".slice" in line and "├─" in line:
                     slice_count += 1
-                elif ".scope" in line:
+                elif ".scope" in line and "├─" in line:
                     scope_count += 1
             
             cgroup_data.append(["Services", str(service_count)])
@@ -354,21 +373,27 @@ WantedBy=default.target
 """
         
         service_path = os.path.expanduser("~/.config/systemd/user/sample-user.service")
+        service_dir = os.path.dirname(service_path)
         
         service_data = []
         
-        if not os.path.exists(os.path.dirname(service_path)):
-            service_data.append(["Status", f"Directory {os.path.dirname(service_path)} does not exist"])
-        else:
+        if not os.path.exists(service_dir):
             try:
-                with open(service_path, 'w') as f:
-                    f.write(sample_service)
-                service_data.append(["Status", "Sample service file created"])
-                service_data.append(["Path", service_path])
-                service_data.append(["Action", "Run: systemctl --user daemon-reload"])
-                service_data.append(["Action", "Run: systemctl --user enable --now sample-user.service"])
+                os.makedirs(service_dir, exist_ok=True)
+                service_data.append(["Status", f"Created directory {service_dir}"])
             except Exception as e:
-                service_data.append(["Status", f"Failed to create: {e}"])
+                service_data.append(["Status", f"Failed to create directory: {e}"])
+                return service_data
+        
+        try:
+            with open(service_path, 'w') as f:
+                f.write(sample_service)
+            service_data.append(["Status", "Sample service file created"])
+            service_data.append(["Path", service_path])
+            service_data.append(["Action", "Run: systemctl --user daemon-reload"])
+            service_data.append(["Action", "Run: systemctl --user enable --now sample-user.service"])
+        except Exception as e:
+            service_data.append(["Status", f"Failed to create: {e}"])
         
         self.display_table(
             "SAMPLE USER SERVICE CREATION",
@@ -396,10 +421,10 @@ WantedBy=default.target
         linger = self.user_info.get('linger', 'Unknown')
         summary_data.append(["Linger Enabled", linger])
         
-        config_exists = any("Present" in str(item) for item in self.user_info.get('directories', []))
+        config_exists = any("Present" in str(item[2]) for item in self.user_info.get('directories', []))
         summary_data.append(["Config Directory", "Exists" if config_exists else "Missing"])
         
-        manager_ok = any("running" in str(item).lower() for item in self.user_info.get('manager_status', []))
+        manager_ok = any("running" in str(item[1]).lower() for item in self.user_info.get('manager_status', []))
         summary_data.append(["User Manager", "Running" if manager_ok else "Not Running"])
         
         self.display_table(
