@@ -1,499 +1,712 @@
 #!/usr/bin/env python3
+
 import subprocess
 import json
 import sys
 import os
 import pwd
 import grp
-from tabulate import tabulate
+import getpass
+import logging
+import platform
+import textwrap
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
 
-class SystemdUserProcessChecker:
-    def __init__(self, verbose=False):
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+class Color:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    RESET = '\033[0m'
+
+
+@dataclass
+class UserInfo:
+    name: str
+    uid: int
+    gid: int
+    home: str
+    groups: List[str]
+    linger: Optional[bool] = None
+
+
+@dataclass
+class SystemdDir:
+    name: str
+    path: Path
+    exists: bool
+    is_directory: bool
+    unit_count: int = 0
+    accessible: bool = True
+
+
+@dataclass
+class SystemdUnit:
+    name: str
+    state: str
+    load: str = "unknown"
+    active: str = "unknown"
+    sub: str = "unknown"
+    description: str = ""
+
+
+@dataclass
+class SystemdTimer:
+    name: str
+    next_activation: Optional[str] = None
+    time_left: Optional[str] = None
+    last_activation: Optional[str] = None
+
+
+class SystemdUserChecker:
+    def __init__(self, verbose=False, color=True):
         self.verbose = verbose
-        self.user_info = {}
+        self.use_color = color and sys.stdout.isatty()
+        self.logger = self._setup_logger()
+        self.user_info = None
+        self.directories = []
+        self.services = []
+        self.sockets = []
+        self.timers = []
+        self.manager_status = {}
+        self.summary = {}
+        self._validate_environment()
     
-    def run_command(self, cmd, user_mode=False):
+    def _setup_logger(self):
+        logger = logging.getLogger(__name__)
+        if not logger.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
+        return logger
+    
+    def _validate_environment(self):
+        if platform.system() != 'Linux':
+            self._error("This tool only works on Linux systems")
+            sys.exit(1)
+        
         try:
-            if user_mode:
-                cmd = f"sudo -u {os.getlogin()} {cmd}"
             result = subprocess.run(
-                cmd,
-                shell=True,
+                ['systemctl', '--version'],
                 capture_output=True,
                 text=True,
                 check=False
             )
+            if result.returncode != 0:
+                self._error("Systemd not found or not accessible")
+                sys.exit(1)
+        except FileNotFoundError:
+            self._error("systemctl command not found")
+            sys.exit(1)
+    
+    def _colorize(self, text, color):
+        if self.use_color:
+            return f"{color}{text}{Color.RESET}"
+        return text
+    
+    def _error(self, message):
+        print(f"{self._colorize('Error:', Color.RED)} {message}", file=sys.stderr)
+        self.logger.error(message)
+    
+    def _warning(self, message):
+        print(f"{self._colorize('Warning:', Color.YELLOW)} {message}", file=sys.stderr)
+        self.logger.warning(message)
+    
+    def _run_command(self, cmd_args, capture=True):
+        try:
+            self.logger.debug(f"Running command: {' '.join(cmd_args)}")
+            result = subprocess.run(
+                cmd_args,
+                capture_output=capture,
+                text=True,
+                check=False,
+                timeout=30
+            )
             return result.stdout.strip(), result.returncode
-        except Exception:
-            return "", 1
+        except subprocess.TimeoutExpired:
+            self._warning(f"Command timed out: {' '.join(cmd_args)}")
+            return "Command timed out", 124
+        except Exception as e:
+            self.logger.error(f"Command failed: {e}")
+            return str(e), 1
     
-    def display_table(self, title, headers, data, table_format="simple"):
-        print("\n" + "="*80)
-        print(title.center(80))
-        print("="*80)
-        if data:
-            print(tabulate(data, headers=headers, tablefmt=table_format))
-        else:
-            print("No data available")
+    def _run_user_command(self, cmd_args):
+        if os.getuid() == self.user_info.uid:
+            return self._run_command(cmd_args)
+        
+        user_cmd = ['systemd-run', '--user', '--wait', '--pipe'] + cmd_args
+        return self._run_command(user_cmd)
     
-    def check_current_user(self):
-        user_data = []
+    def get_current_user(self):
         try:
-            current_user = os.getlogin()
-        except:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        user_id = os.getuid()
-        
-        user_data.append(["Username", current_user])
-        user_data.append(["User ID", str(user_id)])
-        user_data.append(["Home Directory", os.path.expanduser("~")])
-        
-        try:
-            groups = [g.gr_name for g in grp.getgrall() if current_user in g.gr_mem]
-            user_data.append(["Group Memberships", ", ".join(groups[:5]) + ("..." if len(groups) > 5 else "")])
-        except:
-            user_data.append(["Group Memberships", "Unknown"])
-        
-        self.display_table(
-            "CURRENT USER INFORMATION",
-            ["Property", "Value"],
-            user_data
-        )
-        
-        self.user_info['current_user'] = {
-            'name': current_user,
-            'uid': user_id,
-            'home': os.path.expanduser("~")
-        }
-        
-        return current_user
+            username = getpass.getuser()
+            pw_entry = pwd.getpwnam(username)
+            
+            groups = []
+            try:
+                for group in grp.getgrall():
+                    if username in group.gr_mem:
+                        groups.append(group.gr_name)
+            except Exception as e:
+                self._warning(f"Could not get group memberships: {e}")
+            
+            self.user_info = UserInfo(
+                name=username,
+                uid=pw_entry.pw_uid,
+                gid=pw_entry.pw_gid,
+                home=pw_entry.pw_dir,
+                groups=groups
+            )
+            
+            self._display_user_info()
+            return self.user_info
+            
+        except Exception as e:
+            self._error(f"Failed to get user info: {e}")
+            sys.exit(1)
     
-    def check_user_service_directories(self):
-        dir_data = []
+    def _display_user_info(self):
+        if not self.user_info:
+            return
         
-        user_config_dir = os.path.expanduser("~/.config/systemd/user")
-        user_runtime_dir = f"/run/user/{os.getuid()}"
-        user_local_dir = os.path.expanduser("~/.local/share/systemd/user")
-        
-        directories = [
-            ("User Config", user_config_dir),
-            ("User Runtime", user_runtime_dir),
-            ("User Local", user_local_dir)
+        data = [
+            ["Username", self.user_info.name],
+            ["User ID", str(self.user_info.uid)],
+            ["Group ID", str(self.user_info.gid)],
+            ["Home Directory", self.user_info.home],
+            ["Groups", ", ".join(self.user_info.groups[:10]) + 
+             ("..." if len(self.user_info.groups) > 10 else "")]
         ]
         
+        self._display_table("CURRENT USER INFORMATION", ["Property", "Value"], data)
+    
+    def check_user_directories(self):
+        if not self.user_info:
+            self.get_current_user()
+        
+        directories = [
+            ("User Config", Path(self.user_info.home) / ".config/systemd/user"),
+            ("User Runtime", Path(f"/run/user/{self.user_info.uid}")),
+            ("User Local", Path(self.user_info.home) / ".local/share/systemd/user"),
+            ("System User", Path(f"/usr/lib/systemd/user")),
+            ("System Local", Path(f"/usr/local/lib/systemd/user"))
+        ]
+        
+        dir_objects = []
+        display_data = []
+        
         for name, path in directories:
-            exists = os.path.exists(path)
-            is_dir = os.path.isdir(path) if exists else False
-            file_count = 0
+            exists = path.exists()
+            is_dir = path.is_dir() if exists else False
+            unit_count = 0
+            accessible = True
             
             if exists and is_dir:
                 try:
-                    files = os.listdir(path)
-                    unit_files = [f for f in files if any(f.endswith(ext) for ext in ['.service', '.socket', '.timer'])]
-                    file_count = len(unit_files)
-                except:
-                    file_count = -1
+                    unit_extensions = ['.service', '.socket', '.timer', '.target', '.mount', '.automount']
+                    for ext in unit_extensions:
+                        unit_count += len(list(path.glob(f"*{ext}")))
+                except PermissionError:
+                    accessible = False
+                    unit_count = -1
+                except Exception as e:
+                    self._warning(f"Could not scan {path}: {e}")
+                    accessible = False
             
-            status = "Present" if exists else "Missing"
-            if file_count > 0:
-                status = f"Present ({file_count} units)"
-            elif file_count == -1:
-                status = "Access Denied"
+            dir_obj = SystemdDir(
+                name=name,
+                path=path,
+                exists=exists,
+                is_directory=is_dir,
+                unit_count=unit_count,
+                accessible=accessible
+            )
+            dir_objects.append(dir_obj)
             
-            dir_data.append([name, path, status])
+            if not exists:
+                status = self._colorize("Missing", Color.RED)
+            elif not accessible:
+                status = self._colorize("Access Denied", Color.YELLOW)
+            elif unit_count > 0:
+                status = self._colorize(f"Present ({unit_count} units)", Color.GREEN)
+            else:
+                status = self._colorize("Present (empty)", Color.BLUE)
+            
+            display_data.append([name, str(path), status])
         
-        self.display_table(
-            "USER SYSTEMD DIRECTORIES",
-            ["Directory Type", "Path", "Status"],
-            dir_data
-        )
+        self.directories = dir_objects
+        self._display_table("USER SYSTEMD DIRECTORIES", ["Directory", "Path", "Status"], display_data)
         
-        self.user_info['directories'] = dir_data
-        
-        return user_config_dir
+        return dir_objects
     
-    def check_user_systemd_status(self):
-        status_data = []
+    def check_systemd_manager(self):
+        output, code = self._run_user_command(['systemctl', '--user', '--no-pager', 'status'])
         
-        cmd = "systemctl --user --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
+        status_data = {}
+        display_data = []
         
         if code == 0:
             lines = output.split('\n')
             for line in lines:
-                if "State:" in line:
-                    status_data.append(["User Systemd State", line.split("State:", 1)[1].strip()])
-                elif "Jobs:" in line:
-                    status_data.append(["Active Jobs", line.split("Jobs:", 1)[1].strip()])
-                elif "Failed:" in line:
-                    status_data.append(["Failed Units", line.split("Failed:", 1)[1].strip()])
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    status_data[key] = value
+                    
+                    if key == 'State' and 'running' in value.lower():
+                        display_value = self._colorize(value, Color.GREEN)
+                    elif key == 'State':
+                        display_value = self._colorize(value, Color.RED)
+                    elif 'failed' in key.lower() and value != '0':
+                        display_value = self._colorize(value, Color.RED)
+                    else:
+                        display_value = value
+                    
+                    display_data.append([key, display_value])
         else:
-            status_data.append(["User Systemd State", "Not accessible"])
+            display_data.append(["Status", self._colorize("User systemd not running", Color.RED)])
+            status_data["Status"] = "Not running"
         
-        self.display_table(
-            "USER SYSTEMD MANAGER STATUS",
-            ["Property", "Value"],
-            status_data
-        )
-        
-        self.user_info['manager_status'] = status_data
-        
-        return code == 0
-    
-    def list_user_services(self):
-        cmd = "systemctl --user list-unit-files --type=service --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
-        
-        service_data = []
-        
-        if code == 0:
-            lines = output.split('\n')
-            start_processing = False
-            
-            for line in lines:
-                if "UNIT FILE" in line and "STATE" in line:
-                    start_processing = True
-                    continue
-                
-                if start_processing and line.strip() and not line.startswith("unit files listed"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        service_name = parts[0]
-                        state = parts[-1]
-                        service_data.append([service_name, state])
-        
-        self.display_table(
-            "USER SERVICE FILES",
-            ["Service Name", "State"],
-            service_data[:20]
-        )
-        
-        if len(service_data) > 20:
-            print(f"... and {len(service_data) - 20} more services")
-        
-        self.user_info['services'] = service_data
-        
-        return service_data
-    
-    def check_user_sockets(self):
-        cmd = "systemctl --user list-units --type=socket --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
-        
-        socket_data = []
-        
-        if code == 0:
-            lines = output.split('\n')
-            start_processing = False
-            
-            for line in lines:
-                if "UNIT" in line and "LOAD" in line and "ACTIVE" in line and "SUB" in line:
-                    start_processing = True
-                    continue
-                
-                if start_processing and line.strip():
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        unit = parts[0]
-                        load = parts[1]
-                        active = parts[2]
-                        socket_data.append([unit, load, active])
-        
-        self.display_table(
-            "USER SOCKET UNITS",
-            ["Socket Unit", "Load State", "Active State"],
-            socket_data
-        )
-        
-        self.user_info['sockets'] = socket_data
-        
-        return socket_data
-    
-    def check_user_timers(self):
-        cmd = "systemctl --user list-timers --all --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
-        
-        timer_data = []
-        
-        if code == 0:
-            lines = output.split('\n')
-            start_processing = False
-            
-            for line in lines:
-                if "NEXT" in line and "LEFT" in line and "LAST" in line:
-                    start_processing = True
-                    continue
-                
-                if start_processing and line.strip() and not line.startswith("timers listed"):
-                    parts = line.split(maxsplit=5)
-                    if len(parts) >= 4:
-                        timer_name = parts[0]
-                        if len(parts) >= 6:
-                            next_activation = f"{parts[1]} {parts[2]}"
-                            time_left = parts[3]
-                            last_activation = f"{parts[4]} {parts[5]}"
-                        elif len(parts) >= 4:
-                            next_activation = parts[1] if len(parts) > 1 else "N/A"
-                            time_left = parts[2] if len(parts) > 2 else "N/A"
-                            last_activation = parts[3] if len(parts) > 3 else "N/A"
-                        timer_data.append([timer_name, next_activation, time_left, last_activation])
-        
-        self.display_table(
-            "USER TIMER UNITS",
-            ["Timer Name", "Next Activation", "Time Left", "Last Activation"],
-            timer_data
-        )
-        
-        self.user_info['timers'] = timer_data
-        
-        return timer_data
-    
-    def check_user_service_status(self):
-        cmd = "systemctl --user --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
-        
-        status_data = []
-        
-        if code == 0:
-            lines = output.split('\n')
-            for line in lines:
-                if "State:" in line:
-                    status_data.append(["User Systemd State", line.split("State:", 1)[1].strip()])
-                elif "Memory:" in line:
-                    status_data.append(["Memory Usage", line.split("Memory:", 1)[1].strip()])
-        
-        self.display_table(
-            "USER SYSTEMD PROCESS STATUS",
-            ["Property", "Value"],
-            status_data
-        )
-        
-        self.user_info['process_status'] = status_data
+        self.manager_status = status_data
+        self._display_table("USER SYSTEMD MANAGER STATUS", ["Property", "Value"], display_data)
         
         return status_data
     
-    def check_lingering_users(self):
-        cmd = "loginctl list-users --no-pager"
-        output, code = self.run_command(cmd)
+    def list_user_units(self, unit_type="service"):
+        units = []
         
-        user_data = []
+        cmd = ['systemctl', '--user', 'list-units', f'--type={unit_type}', '--no-pager', '--plain']
+        output, code = self._run_user_command(cmd)
+        
+        if code != 0:
+            self._warning(f"Failed to list {unit_type} units")
+            return units
+        
+        lines = output.split('\n')
+        header_found = False
+        
+        for line in lines:
+            if not line.strip():
+                continue
+            
+            if line.startswith('UNIT') and 'LOAD' in line and 'ACTIVE' in line and 'SUB' in line:
+                header_found = True
+                continue
+            
+            if header_found:
+                parts = line.split()
+                if len(parts) >= 5:
+                    unit = SystemdUnit(
+                        name=parts[0],
+                        state="unknown",
+                        load=parts[1],
+                        active=parts[2],
+                        sub=parts[3],
+                        description=' '.join(parts[4:]) if len(parts) > 4 else ''
+                    )
+                    units.append(unit)
+        
+        cmd_files = ['systemctl', '--user', 'list-unit-files', f'--type={unit_type}', '--no-pager']
+        output_files, _ = self._run_user_command(cmd_files)
+        
+        unit_states = {}
+        for line in output_files.split('\n'):
+            if line.strip() and not line.startswith('UNIT') and not line.startswith('unit files'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    unit_states[parts[0]] = parts[-1]
+        
+        for unit in units:
+            if unit.name in unit_states:
+                unit.state = unit_states[unit.name]
+        
+        display_data = []
+        for unit in units[:20]:
+            active_color = Color.GREEN if unit.active == 'active' else Color.RED
+            display_data.append([
+                unit.name,
+                self._colorize(unit.load, Color.BLUE),
+                self._colorize(unit.active, active_color),
+                unit.sub,
+                unit.description[:40] + "..." if len(unit.description) > 40 else unit.description
+            ])
+        
+        headers = ["Unit", "Load", "Active", "Sub", "Description"]
+        self._display_table(f"USER {unit_type.upper()} UNITS", headers, display_data)
+        
+        if len(units) > 20:
+            print(f"... and {len(units) - 20} more {unit_type}s")
+        
+        if unit_type == "service":
+            self.services = units
+        elif unit_type == "socket":
+            self.sockets = units
+        
+        return units
+    
+    def list_user_timers(self):
+        cmd = ['systemctl', '--user', 'list-timers', '--all', '--no-pager']
+        output, code = self._run_user_command(cmd)
+        
+        timers = []
         
         if code == 0:
             lines = output.split('\n')
+            header_found = False
+            
             for line in lines:
-                if "UID" in line and "USER" in line:
+                if not line.strip():
                     continue
-                if line.strip():
+                
+                if 'NEXT' in line and 'LEFT' in line and 'LAST' in line:
+                    header_found = True
+                    continue
+                
+                if header_found and not line.startswith('timers listed'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        timer = SystemdTimer(
+                            name=parts[0],
+                            next_activation=' '.join(parts[1:3]) if len(parts) >= 3 else parts[1],
+                            time_left=parts[3] if len(parts) >= 4 else None,
+                            last_activation=' '.join(parts[4:6]) if len(parts) >= 6 else None
+                        )
+                        timers.append(timer)
+        
+        display_data = []
+        for timer in timers:
+            display_data.append([
+                timer.name,
+                timer.next_activation or "N/A",
+                timer.time_left or "N/A",
+                timer.last_activation or "N/A"
+            ])
+        
+        headers = ["Timer", "Next", "Left", "Last"]
+        self._display_table("USER TIMER UNITS", headers, display_data)
+        
+        self.timers = timers
+        return timers
+    
+    def check_linger_status(self):
+        if not self.user_info:
+            self.get_current_user()
+        
+        cmd = ['loginctl', 'show-user', self.user_info.name, '-p', 'Linger']
+        output, code = self._run_command(cmd)
+        
+        linger = None
+        if code == 0:
+            for line in output.split('\n'):
+                if line.startswith('Linger='):
+                    linger = line.split('=')[1].strip() == 'yes'
+                    break
+        
+        display_data = [[
+            self.user_info.name,
+            self._colorize("Enabled", Color.GREEN) if linger else 
+            self._colorize("Disabled", Color.RED) if linger is False else "Unknown"
+        ]]
+        
+        self._display_table("USER LINGER STATUS", ["Username", "Linger"], display_data)
+        
+        if self.user_info:
+            self.user_info.linger = linger
+        
+        return linger
+    
+    def check_system_users(self):
+        cmd = ['loginctl', 'list-users', '--no-pager']
+        output, code = self._run_command(cmd)
+        
+        users = []
+        if code == 0:
+            lines = output.split('\n')
+            for line in lines:
+                if line.strip() and not line.startswith('UID'):
                     parts = line.split()
                     if len(parts) >= 3:
-                        uid = parts[0]
-                        user = parts[1]
-                        sessions = parts[2]
-                        user_data.append([uid, user, sessions])
+                        users.append({
+                            'uid': parts[0],
+                            'user': parts[1],
+                            'sessions': parts[2]
+                        })
         
-        self.display_table(
-            "SYSTEM USERS WITH SESSIONS",
-            ["UID", "Username", "Sessions"],
-            user_data
-        )
+        display_data = []
+        for user in users:
+            is_current = user['user'] == self.user_info.name
+            user_display = self._colorize(user['user'], Color.CYAN) if is_current else user['user']
+            display_data.append([user['uid'], user_display, user['sessions']])
         
-        self.user_info['system_users'] = user_data
+        self._display_table("SYSTEM USERS WITH SESSIONS", ["UID", "User", "Sessions"], display_data)
         
-        try:
-            current_user = os.getlogin()
-        except:
-            current_user = pwd.getpwuid(os.getuid()).pw_name
-        
-        cmd_linger = f"loginctl show-user {current_user} | grep Linger"
-        output_linger, _ = self.run_command(cmd_linger)
-        
-        linger_status = "Disabled"
-        if "Linger=yes" in output_linger:
-            linger_status = "Enabled"
-        elif "Linger=no" in output_linger:
-            linger_status = "Disabled"
-        
-        linger_data = [[current_user, linger_status]]
-        
-        self.display_table(
-            "USER LINGER STATUS",
-            ["Username", "Linger"],
-            linger_data
-        )
-        
-        self.user_info['linger'] = linger_status
-        
-        return linger_status
+        return users
     
-    def check_user_cgroups(self):
-        cmd = "systemd-cgls --user --no-pager"
-        output, code = self.run_command(cmd, user_mode=True)
+    def check_cgroup_resources(self):
+        cmd = ['systemd-cgls', '--user', '--no-pager']
+        output, code = self._run_user_command(cmd)
         
-        cgroup_data = []
+        stats = {
+            'services': 0,
+            'slices': 0,
+            'scopes': 0,
+            'processes': 0
+        }
         
         if code == 0:
             lines = output.split('\n')
-            service_count = 0
-            slice_count = 0
-            scope_count = 0
-            
             for line in lines:
-                if ".service" in line and "├─" in line:
-                    service_count += 1
-                elif ".slice" in line and "├─" in line:
-                    slice_count += 1
-                elif ".scope" in line and "├─" in line:
-                    scope_count += 1
-            
-            cgroup_data.append(["Services", str(service_count)])
-            cgroup_data.append(["Slices", str(slice_count)])
-            cgroup_data.append(["Scopes", str(scope_count)])
+                if '.service' in line:
+                    stats['services'] += 1
+                elif '.slice' in line:
+                    stats['slices'] += 1
+                elif '.scope' in line:
+                    stats['scopes'] += 1
+                if '├─' in line or '└─' in line:
+                    stats['processes'] += 1
         
-        self.display_table(
-            "USER CGROUP RESOURCES",
-            ["Resource Type", "Count"],
-            cgroup_data
-        )
+        display_data = [
+            ["Services", str(stats['services'])],
+            ["Slices", str(stats['slices'])],
+            ["Scopes", str(stats['scopes'])],
+            ["Processes", str(stats['processes'])]
+        ]
         
-        self.user_info['cgroups'] = cgroup_data
+        self._display_table("USER CGROUP RESOURCES", ["Resource", "Count"], display_data)
         
-        return cgroup_data
+        return stats
     
-    def create_sample_user_service(self):
-        sample_service = """[Unit]
-Description=Sample User Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/bin/bash -c 'while true; do echo "User service running at $(date)" >> /tmp/user-service.log; sleep 30; done'
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-"""
+    def _display_table(self, title, headers, data):
+        print(f"\n{self._colorize('=' * 80, Color.BOLD)}")
+        print(f"{self._colorize(title.center(80), Color.BOLD)}")
+        print(f"{self._colorize('=' * 80, Color.BOLD)}")
         
-        service_path = os.path.expanduser("~/.config/systemd/user/sample-user.service")
-        service_dir = os.path.dirname(service_path)
+        if not data:
+            print("No data available")
+            return
         
-        service_data = []
-        
-        if not os.path.exists(service_dir):
-            try:
-                os.makedirs(service_dir, exist_ok=True)
-                service_data.append(["Status", f"Created directory {service_dir}"])
-            except Exception as e:
-                service_data.append(["Status", f"Failed to create directory: {e}"])
-                return service_data
-        
-        try:
-            with open(service_path, 'w') as f:
-                f.write(sample_service)
-            service_data.append(["Status", "Sample service file created"])
-            service_data.append(["Path", service_path])
-            service_data.append(["Action", "Run: systemctl --user daemon-reload"])
-            service_data.append(["Action", "Run: systemctl --user enable --now sample-user.service"])
-        except Exception as e:
-            service_data.append(["Status", f"Failed to create: {e}"])
-        
-        self.display_table(
-            "SAMPLE USER SERVICE CREATION",
-            ["Property", "Value"],
-            service_data
-        )
-        
-        return service_data
+        if HAS_TABULATE:
+            print(tabulate(data, headers=headers, tablefmt="simple"))
+        else:
+            col_widths = [len(h) for h in headers]
+            for row in data:
+                for i, cell in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(str(cell)))
+            
+            header_row = " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+            print(header_row)
+            print("-" * len(header_row))
+            
+            for row in data:
+                print(" | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)))
     
     def generate_summary(self):
-        summary_data = []
+        if not self.user_info:
+            self.get_current_user()
         
-        user_name = self.user_info.get('current_user', {}).get('name', 'Unknown')
-        summary_data.append(["Current User", user_name])
+        summary = {
+            'user': {
+                'name': self.user_info.name,
+                'uid': self.user_info.uid,
+                'linger': self.user_info.linger
+            },
+            'directories': {
+                'config_exists': any(d.exists for d in self.directories if "Config" in d.name),
+                'total_units': sum(d.unit_count for d in self.directories if d.unit_count > 0)
+            },
+            'services': {
+                'total': len(self.services),
+                'active': len([s for s in self.services if s.active == 'active']),
+                'failed': len([s for s in self.services if s.active == 'failed'])
+            },
+            'sockets': {
+                'total': len(self.sockets),
+                'active': len([s for s in self.sockets if s.active == 'active'])
+            },
+            'timers': {
+                'total': len(self.timers)
+            },
+            'manager': {
+                'running': 'running' in str(self.manager_status.get('State', '')).lower()
+            }
+        }
         
-        services = len(self.user_info.get('services', []))
-        summary_data.append(["User Services", str(services)])
+        display_data = [
+            ["User", f"{summary['user']['name']} (UID: {summary['user']['uid']})"],
+            ["Linger", 
+             self._colorize("Enabled", Color.GREEN) if summary['user']['linger'] 
+             else self._colorize("Disabled", Color.YELLOW) if summary['user']['linger'] is False 
+             else "Unknown"],
+            ["Config Dir", 
+             self._colorize("Exists", Color.GREEN) if summary['directories']['config_exists'] 
+             else self._colorize("Missing", Color.RED)],
+            ["Total Units", str(summary['directories']['total_units'])],
+            ["Services", f"{summary['services']['active']} active / {summary['services']['total']} total"],
+            ["Sockets", f"{summary['sockets']['active']} active / {summary['sockets']['total']} total"],
+            ["Timers", str(summary['timers']['total'])],
+            ["Manager", 
+             self._colorize("Running", Color.GREEN) if summary['manager']['running'] 
+             else self._colorize("Not Running", Color.RED)]
+        ]
         
-        sockets = len(self.user_info.get('sockets', []))
-        summary_data.append(["User Sockets", str(sockets)])
+        self._display_table("SUMMARY", ["Component", "Status"], display_data)
         
-        timers = len(self.user_info.get('timers', []))
-        summary_data.append(["User Timers", str(timers)])
-        
-        linger = self.user_info.get('linger', 'Unknown')
-        summary_data.append(["Linger Enabled", linger])
-        
-        config_exists = any("Present" in str(item[2]) for item in self.user_info.get('directories', []))
-        summary_data.append(["Config Directory", "Exists" if config_exists else "Missing"])
-        
-        manager_ok = any("running" in str(item[1]).lower() for item in self.user_info.get('manager_status', []))
-        summary_data.append(["User Manager", "Running" if manager_ok else "Not Running"])
-        
-        self.display_table(
-            "USER PROCESS MANAGEMENT SUMMARY",
-            ["Component", "Status"],
-            summary_data,
-            "grid"
-        )
-        
-        summary = {row[0].lower().replace(" ", "_"): row[1] for row in summary_data}
-        self.user_info['summary'] = summary
+        self.summary = summary
         return summary
     
-    def run_full_check(self):
-        print("SYSTEMD USER PROCESS MANAGEMENT ANALYSIS")
-        print("="*80)
-        
-        self.check_current_user()
-        self.check_user_service_directories()
-        self.check_user_systemd_status()
-        self.list_user_services()
-        self.check_user_sockets()
-        self.check_user_timers()
-        self.check_user_service_status()
-        self.check_lingering_users()
-        self.check_user_cgroups()
-        
-        if self.verbose:
-            self.create_sample_user_service()
-        
-        summary = self.generate_summary()
-        
-        return self.user_info, summary
-    
     def export_json(self, filename="user_process_mgmt.json"):
+        data = {
+            'user_info': asdict(self.user_info) if self.user_info else None,
+            'directories': [asdict(d) for d in self.directories],
+            'services': [asdict(s) for s in self.services],
+            'sockets': [asdict(s) for s in self.sockets],
+            'timers': [asdict(t) for t in self.timers],
+            'manager_status': self.manager_status,
+            'summary': self.summary
+        }
+        
         try:
             with open(filename, 'w') as f:
-                json.dump(self.user_info, f, indent=2, default=str)
-            print(f"User process management state exported to {filename}")
+                json.dump(data, f, indent=2, default=str)
+            print(f"\n{self._colorize('✓', Color.GREEN)} Data exported to {filename}")
+            return True
         except Exception as e:
-            print(f"Failed to export JSON: {e}")
+            self._error(f"Failed to export JSON: {e}")
+            return False
+    
+    def run_checks(self):
+        print(f"\n{self._colorize('SYSTEMD USER PROCESS MANAGEMENT ANALYSIS', Color.BOLD + Color.CYAN)}")
+        print(f"{self._colorize('=' * 80, Color.BOLD)}\n")
+        
+        self.get_current_user()
+        self.check_user_directories()
+        self.check_systemd_manager()
+        self.list_user_units("service")
+        self.list_user_units("socket")
+        self.list_user_timers()
+        self.check_linger_status()
+        self.check_system_users()
+        self.check_cgroup_resources()
+        self.generate_summary()
+        
+        return {
+            'user_info': self.user_info,
+            'summary': self.summary,
+            'services': self.services,
+            'sockets': self.sockets
+        }
+
+
+def print_help_commands():
+    commands = [
+        ("Check user systemd status", "systemctl --user status"),
+        ("Start a user service", "systemctl --user start <service>"),
+        ("Stop a user service", "systemctl --user stop <service>"),
+        ("Enable service at login", "systemctl --user enable <service>"),
+        ("Disable service", "systemctl --user disable <service>"),
+        ("Reload unit files", "systemctl --user daemon-reload"),
+        ("View user journal", "journalctl --user -f"),
+        ("Enable lingering", "loginctl enable-linger $USER"),
+        ("Disable lingering", "loginctl disable-linger $USER"),
+        ("List user units", "systemctl --user list-units"),
+        ("Check failed units", "systemctl --user --failed"),
+    ]
+    
+    print(f"\n{Color.BOLD}Common Systemd User Commands:{Color.RESET}")
+    print(f"{Color.BLUE}{'=' * 60}{Color.RESET}")
+    
+    for desc, cmd in commands:
+        print(f"{Color.GREEN}{desc:<30}{Color.RESET} {Color.YELLOW}{cmd}{Color.RESET}")
+    
+    print(f"{Color.BLUE}{'=' * 60}{Color.RESET}")
 
 
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Check systemd user process management')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output including sample service creation')
-    parser.add_argument('--json', '-j', action='store_true', help='Export results to JSON')
-    parser.add_argument('--output', '-o', default='user_process_mgmt.json', help='Output JSON filename')
-    parser.add_argument('--sample', '-s', action='store_true', help='Create sample user service')
+    parser = argparse.ArgumentParser(
+        description='Check systemd user process management',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Verbose output including journal errors')
+    parser.add_argument('--json', '-j', action='store_true',
+                       help='Export results to JSON')
+    parser.add_argument('--output', '-o', default='user_process_mgmt.json',
+                       help='Output JSON filename')
+    parser.add_argument('--sample', '-s', action='store_true',
+                       help='Create sample user service')
+    parser.add_argument('--no-color', action='store_true',
+                       help='Disable colored output')
     
     args = parser.parse_args()
     
-    checker = SystemdUserProcessChecker(verbose=args.verbose or args.sample)
-    user_info, summary = checker.run_full_check()
-    
-    if args.json:
-        checker.export_json(args.output)
-    
-    print("\nCommon user systemd commands:")
-    print("  systemctl --user status                 Check user systemd status")
-    print("  systemctl --user start <service>        Start a user service")
-    print("  systemctl --user enable <service>       Enable service at login")
-    print("  systemctl --user daemon-reload          Reload user unit files")
-    print("  journalctl --user                       View user logs")
-    print("  loginctl enable-linger                  Enable lingering (run at boot)")
-    
-    sys.exit(0)
+    try:
+        checker = SystemdUserChecker(
+            verbose=args.verbose,
+            color=not args.no_color
+        )
+        
+        results = checker.run_checks()
+        
+        if args.sample:
+            print("\n" + "="*80)
+            print("SAMPLE SERVICE CREATION".center(80))
+            print("="*80)
+            print("To create a sample service, use: systemctl --user edit --full --force sample.service")
+            print("Example service content:")
+            print("[Unit]")
+            print("Description=Sample Service")
+            print("")
+            print("[Service]")
+            print("Type=simple")
+            print("ExecStart=/usr/bin/sleep infinity")
+            print("")
+            print("[Install]")
+            print("WantedBy=default.target")
+        
+        if args.json:
+            checker.export_json(args.output)
+        
+        print_help_commands()
+        
+        if results['summary'] and results['summary'].get('manager', {}).get('running'):
+            sys.exit(0)
+        else:
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        print(f"\n{Color.YELLOW}Interrupted by user{Color.RESET}")
+        sys.exit(130)
+    except Exception as e:
+        print(f"{Color.RED}Error: {e}{Color.RESET}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
