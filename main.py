@@ -16,6 +16,7 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 from datetime import datetime
+from contextlib import contextmanager
 
 try:
     from tabulate import tabulate
@@ -141,14 +142,23 @@ class ProgressIndicator:
 
 class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path or Path.home() / ".config" / "systemd-checker" / "config.ini"
+        if config_path:
+            self.config_path = Path(config_path)
+        else:
+            xdg_config = os.environ.get('XDG_CONFIG_HOME')
+            if xdg_config:
+                self.config_path = Path(xdg_config) / "systemd-checker" / "config.ini"
+            else:
+                self.config_path = Path.home() / ".config" / "systemd-checker" / "config.ini"
+        
         self.config = configparser.ConfigParser()
         self.default_config = {
             'general': {
                 'timeout': '30',
                 'max_units_display': '20',
                 'color': 'true',
-                'progress': 'true'
+                'progress': 'true',
+                'max_command_history': '100'
             },
             'paths': {
                 'user_config': '.config/systemd/user',
@@ -200,16 +210,25 @@ class ConfigManager:
     
     def get_int(self, section: str, key: str, fallback: int = 0) -> int:
         try:
-            return self.config.getint(section, key, fallback=fallback)
+            value = self.config.get(section, key, fallback=str(fallback))
+            try:
+                return int(value)
+            except ValueError:
+                return fallback
         except:
-            return int(self.default_config.get(section, {}).get(key, fallback))
+            default_value = self.default_config.get(section, {}).get(key, str(fallback))
+            try:
+                return int(default_value)
+            except ValueError:
+                return fallback
     
     def get_bool(self, section: str, key: str, fallback: bool = False) -> bool:
         try:
-            return self.config.getboolean(section, key, fallback=fallback)
+            value = self.config.get(section, key, fallback=str(fallback)).lower()
+            return value in ('true', 'yes', 'on', '1')
         except:
-            value = self.default_config.get(section, {}).get(key, str(fallback))
-            return value.lower() in ('true', 'yes', 'on', '1')
+            default_value = self.default_config.get(section, {}).get(key, str(fallback)).lower()
+            return default_value in ('true', 'yes', 'on', '1')
 
 
 class SystemdUserChecker:
@@ -228,6 +247,7 @@ class SystemdUserChecker:
         self.summary = {}
         self.progress = ProgressIndicator(enabled=self.show_progress)
         self.command_history: List[CommandResult] = []
+        self.max_command_history = self.config.get_int('general', 'max_command_history', 100)
         self._validate_environment()
     
     def _setup_logger(self) -> logging.Logger:
@@ -285,28 +305,48 @@ class SystemdUserChecker:
         
         try:
             self.logger.debug(f"Running command: {' '.join(cmd_args)}")
-            result = subprocess.run(
-                cmd_args,
-                capture_output=capture,
-                text=True,
-                check=False,
-                timeout=timeout_value
-            )
+            
+            if capture:
+                result = subprocess.run(
+                    cmd_args,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_value
+                )
+                stdout = result.stdout.strip() if result.stdout else ""
+                stderr = result.stderr.strip() if result.stderr else ""
+                returncode = result.returncode
+            else:
+                result = subprocess.run(
+                    cmd_args,
+                    check=False,
+                    timeout=timeout_value
+                )
+                stdout = ""
+                stderr = ""
+                returncode = result.returncode
+            
             duration = time.time() - start_time
             cmd_result = CommandResult(
-                stdout=result.stdout.strip() if capture else "",
-                stderr=result.stderr.strip() if capture else "",
-                returncode=result.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=returncode,
                 command=cmd_args,
                 duration=duration
             )
+            
             self.command_history.append(cmd_result)
+            if len(self.command_history) > self.max_command_history:
+                self.command_history.pop(0)
+            
             return cmd_result
+            
         except subprocess.TimeoutExpired:
             self._warning(f"Command timed out after {timeout_value}s: {' '.join(cmd_args)}")
             return CommandResult(
-                stdout="Command timed out",
-                stderr="Timeout expired",
+                stdout="",
+                stderr=f"Command timed out after {timeout_value} seconds",
                 returncode=ExitCode.TIMEOUT_ERROR.value,
                 command=cmd_args,
                 duration=timeout_value
@@ -314,7 +354,7 @@ class SystemdUserChecker:
         except Exception as e:
             self.logger.error(f"Command failed: {e}")
             return CommandResult(
-                stdout=str(e),
+                stdout="",
                 stderr=str(e),
                 returncode=1,
                 command=cmd_args,
@@ -328,7 +368,7 @@ class SystemdUserChecker:
         if os.getuid() == self.user_info.uid:
             return self._run_command(cmd_args)
         
-        user_cmd = ['systemd-run', '--user', '--wait', '--pipe', '--collect'] + cmd_args
+        user_cmd = ['sudo', '-u', self.user_info.name] + cmd_args
         return self._run_command(user_cmd)
     
     def _display_user_info(self) -> None:
@@ -507,6 +547,23 @@ class SystemdUserChecker:
             self._warning(f"Failed to list {unit_type} units: {result.stderr}")
             return units
         
+        process_map = {}
+        if HAS_PSUTIL and unit_type == "service" and self.user_info:
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info', 'cpu_percent']):
+                    try:
+                        if proc.info['username'] == self.user_info.name:
+                            process_map[proc.info['name']] = {
+                                'pid': proc.info['pid'],
+                                'memory': proc.info['memory_info'].rss if proc.info['memory_info'] else None,
+                                'cpu': proc.info['cpu_percent']
+                            }
+                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                        self.logger.debug(f"Process unavailable: {e}")
+                        continue
+            except Exception as e:
+                self.logger.warning(f"Failed to get process info: {e}")
+        
         lines = result.stdout.split('\n')
         header_found = False
         
@@ -525,17 +582,12 @@ class SystemdUserChecker:
                     memory = None
                     cpu = None
                     
-                    if HAS_PSUTIL and unit_type == "service":
+                    if unit_type == "service":
                         unit_name = parts[0].replace('.service', '')
-                        try:
-                            for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'cpu_percent']):
-                                if unit_name in proc.info['name']:
-                                    pid = proc.info['pid']
-                                    memory = proc.info['memory_info'].rss if proc.info['memory_info'] else None
-                                    cpu = proc.info['cpu_percent']
-                                    break
-                        except:
-                            pass
+                        if unit_name in process_map:
+                            pid = process_map[unit_name]['pid']
+                            memory = process_map[unit_name]['memory']
+                            cpu = process_map[unit_name]['cpu']
                     
                     unit = SystemdUnit(
                         name=parts[0],
@@ -719,8 +771,11 @@ class SystemdUserChecker:
             is_current = user['user'] == self.user_info.name
             user_display = self._colorize(user['user'], Color.CYAN) if is_current else user['user']
             
-            sessions_count = int(user['sessions'])
-            sessions_display = self._colorize(user['sessions'], Color.GREEN) if sessions_count > 0 else self._colorize(user['sessions'], Color.YELLOW)
+            try:
+                sessions_count = int(user['sessions'])
+                sessions_display = self._colorize(user['sessions'], Color.GREEN) if sessions_count > 0 else self._colorize(user['sessions'], Color.YELLOW)
+            except ValueError:
+                sessions_display = user['sessions']
             
             display_data.append([user['uid'], user_display, sessions_display])
         
@@ -751,13 +806,13 @@ class SystemdUserChecker:
                 if '├─' in line or '└─' in line:
                     stats['processes'] += 1
         
-        if HAS_PSUTIL:
+        if HAS_PSUTIL and self.user_info:
             user_procs = 0
             for proc in psutil.process_iter(['pid', 'username']):
                 try:
                     if proc.info['username'] == self.user_info.name:
                         user_procs += 1
-                except:
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             stats['user_processes'] = user_procs
         
@@ -794,6 +849,21 @@ class SystemdUserChecker:
         
         return errors
     
+    def show_service_dependencies(self, service_name: str) -> None:
+        cmd = ['systemctl', '--user', 'list-dependencies', service_name]
+        result = self._run_user_command(cmd)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            dependencies = []
+            for line in result.stdout.split('\n'):
+                if line.strip() and not line.startswith(service_name):
+                    dependencies.append([line.strip()])
+            
+            if dependencies:
+                self._display_table(f"DEPENDENCIES FOR {service_name}", ["Dependency"], dependencies)
+            else:
+                print(f"{self._colorize('No dependencies found', Color.YELLOW)}")
+    
     def _display_table(self, title: str, headers: List[str], data: List[List[Any]]) -> None:
         print(f"\n{self._colorize('=' * 80, Color.BOLD)}")
         print(f"{self._colorize(title.center(80), Color.BOLD)}")
@@ -816,7 +886,13 @@ class SystemdUserChecker:
             print("-" * len(header_row))
             
             for row in data:
-                print(" | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)))
+                formatted_row = []
+                for i, cell in enumerate(row):
+                    if isinstance(cell, str) and self.use_color and cell.startswith('\033'):
+                        formatted_row.append(cell)
+                    else:
+                        formatted_row.append(str(cell).ljust(col_widths[i]))
+                print(" | ".join(formatted_row))
     
     def generate_summary(self) -> Dict[str, Any]:
         if not self.user_info:
@@ -860,7 +936,10 @@ class SystemdUserChecker:
             }
         }
         
-        summary['services']['active_percent'] = round((summary['services']['active'] / summary['services']['total']) * 100, 1) if summary['services']['total'] > 0 else 0
+        if summary['services']['total'] > 0:
+            summary['services']['active_percent'] = round((summary['services']['active'] / summary['services']['total']) * 100, 1)
+        else:
+            summary['services']['active_percent'] = 0
         
         display_data = [
             ["User", f"{summary['user']['name']} (UID: {summary['user']['uid']})"],
@@ -887,6 +966,20 @@ class SystemdUserChecker:
         return summary
     
     def export_json(self, filename: str = "user_process_mgmt.json") -> bool:
+        filename_path = Path(filename)
+        
+        if filename_path.suffix.lower() not in ['.json']:
+            filename_path = filename_path.with_suffix('.json')
+            self._warning(f"Added .json extension: {filename_path}")
+        
+        parent = filename_path.parent
+        if not parent.exists():
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except PermissionError as e:
+                self._error(f"Cannot create directory {parent}: {e}")
+                return False
+        
         data = {
             'generated': datetime.now().isoformat(),
             'version': '1.2.0',
@@ -906,9 +999,9 @@ class SystemdUserChecker:
         
         try:
             json_indent = self.config.get_int('export', 'json_indent', 2)
-            with open(filename, 'w') as f:
+            with open(filename_path, 'w') as f:
                 json.dump(data, f, indent=json_indent, default=str)
-            print(f"\n{self._colorize('✓', Color.GREEN)} Data exported to {filename}")
+            print(f"\n{self._colorize('✓', Color.GREEN)} Data exported to {filename_path}")
             return True
         except Exception as e:
             self._error(f"Failed to export JSON: {e}")
@@ -1035,6 +1128,17 @@ WantedBy=timers.target
     print("  systemctl --user enable --now test.timer")
 
 
+@contextmanager
+def quiet_stderr():
+    original_stderr = sys.stderr
+    try:
+        sys.stderr = open(os.devnull, 'w')
+        yield
+    finally:
+        sys.stderr.close()
+        sys.stderr = original_stderr
+
+
 def main() -> None:
     import argparse
     
@@ -1077,11 +1181,10 @@ Examples:
                        default='all', help='Specific unit type to analyze')
     parser.add_argument('--timeout', type=int,
                        help='Command timeout in seconds')
+    parser.add_argument('--dependencies', '-d', type=str, metavar='SERVICE',
+                       help='Show dependencies for a specific service')
     
     args = parser.parse_args()
-    
-    if args.quiet:
-        sys.stderr = open(os.devnull, 'w')
     
     try:
         config = None
@@ -1100,14 +1203,26 @@ Examples:
             create_test_environment()
             sys.exit(ExitCode.SUCCESS.value)
         
-        checker = SystemdUserChecker(
-            verbose=args.verbose,
-            color=not args.no_color,
-            progress=not args.no_progress,
-            config=config
-        )
+        if args.quiet:
+            with quiet_stderr():
+                checker = SystemdUserChecker(
+                    verbose=args.verbose,
+                    color=not args.no_color,
+                    progress=not args.no_progress,
+                    config=config
+                )
+                results = checker.run_checks()
+        else:
+            checker = SystemdUserChecker(
+                verbose=args.verbose,
+                color=not args.no_color,
+                progress=not args.no_progress,
+                config=config
+            )
+            results = checker.run_checks()
         
-        results = checker.run_checks()
+        if args.dependencies:
+            checker.show_service_dependencies(args.dependencies)
         
         if args.sample:
             print("\n" + "="*80)
