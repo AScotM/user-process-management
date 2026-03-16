@@ -196,11 +196,23 @@ class ConfigManager:
                 self.config.set(section, key, value)
         
         try:
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_dir = self.config_path.parent
+            if not config_dir.exists():
+                config_dir.mkdir(parents=True, exist_ok=True)
+            
+            test_file = config_dir / '.write_test'
+            test_file.touch()
+            test_file.unlink()
+            
             with open(self.config_path, 'w') as f:
                 self.config.write(f)
-        except Exception as e:
-            print(f"{Color.YELLOW}Warning: Could not write default config: {e}{Color.RESET}")
+        except (PermissionError, OSError) as e:
+            self.config = configparser.ConfigParser()
+            for section, options in self.default_config.items():
+                self.config.add_section(section)
+                for key, value in options.items():
+                    self.config.set(section, key, value)
+            print(f"{Color.YELLOW}Using in-memory configuration (cannot write to {config_dir}){Color.RESET}")
     
     def get(self, section: str, key: str, fallback: Any = None) -> str:
         try:
@@ -248,6 +260,8 @@ class SystemdUserChecker:
         self.progress = ProgressIndicator(enabled=self.show_progress)
         self.command_history: List[CommandResult] = []
         self.max_command_history = self.config.get_int('general', 'max_command_history', 100)
+        self._process_cache = {}
+        self._process_cache_time = 0
         self._validate_environment()
     
     def _setup_logger(self) -> logging.Logger:
@@ -362,14 +376,53 @@ class SystemdUserChecker:
             )
     
     def _run_user_command(self, cmd_args: List[str]) -> CommandResult:
-        if not self.user_info:
-            self.get_current_user()
-        
         if os.getuid() == self.user_info.uid:
             return self._run_command(cmd_args)
         
-        user_cmd = ['sudo', '-u', self.user_info.name] + cmd_args
+        if os.geteuid() != 0:
+            self._warning(f"Not running as root, attempting sudo for user {self.user_info.name}")
+        
+        unsafe_commands = ['rm', 'mv', 'dd', 'format', 'mkfs', 'fdisk', 'chmod', 'chown']
+        if any(unsafe_cmd in ' '.join(cmd_args).lower() for unsafe_cmd in unsafe_commands):
+            self._error(f"Potentially unsafe command blocked: {cmd_args}")
+            return CommandResult(
+                stdout="",
+                stderr="Command blocked for security",
+                returncode=1,
+                command=cmd_args,
+                duration=0
+            )
+        
+        user_cmd = ['sudo', '-n', '-u', self.user_info.name] + cmd_args
         return self._run_command(user_cmd)
+    
+    def _get_user_processes(self) -> Dict[str, Dict]:
+        if not HAS_PSUTIL:
+            return {}
+        
+        current_time = time.time()
+        if current_time - self._process_cache_time < 5:
+            return self._process_cache
+        
+        process_map = {}
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info', 'cpu_percent'], timeout=2):
+                try:
+                    if proc.info['username'] == self.user_info.name:
+                        process_map[str(proc.info['pid'])] = {
+                            'name': proc.info['name'],
+                            'pid': proc.info['pid'],
+                            'memory': proc.info['memory_info'].rss if proc.info['memory_info'] else None,
+                            'cpu': proc.info['cpu_percent']
+                        }
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                    continue
+        except Exception as e:
+            self.logger.warning(f"Process iteration failed: {e}")
+        
+        self._process_cache = process_map
+        self._process_cache_time = current_time
+        return process_map
     
     def _display_user_info(self) -> None:
         if not self.user_info:
@@ -452,7 +505,7 @@ class SystemdUserChecker:
                 try:
                     unit_extensions = ['.service', '.socket', '.timer', '.target', '.mount', '.automount', '.path', '.slice']
                     for ext in unit_extensions:
-                        unit_count += len(list(path.glob(f"*{ext}")))
+                        unit_count += sum(1 for _ in path.glob(f"*{ext}"))
                     
                     if not os.access(path, os.R_OK):
                         accessible = False
@@ -547,22 +600,7 @@ class SystemdUserChecker:
             self._warning(f"Failed to list {unit_type} units: {result.stderr}")
             return units
         
-        process_map = {}
-        if HAS_PSUTIL and unit_type == "service" and self.user_info:
-            try:
-                for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info', 'cpu_percent']):
-                    try:
-                        if proc.info['username'] == self.user_info.name:
-                            process_map[proc.info['name']] = {
-                                'pid': proc.info['pid'],
-                                'memory': proc.info['memory_info'].rss if proc.info['memory_info'] else None,
-                                'cpu': proc.info['cpu_percent']
-                            }
-                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                        self.logger.debug(f"Process unavailable: {e}")
-                        continue
-            except Exception as e:
-                self.logger.warning(f"Failed to get process info: {e}")
+        process_map = self._get_user_processes()
         
         lines = result.stdout.split('\n')
         header_found = False
@@ -578,28 +616,27 @@ class SystemdUserChecker:
             if header_found and not line.startswith('●'):
                 parts = line.split()
                 if len(parts) >= 5:
-                    pid = None
-                    memory = None
-                    cpu = None
-                    
-                    if unit_type == "service":
-                        unit_name = parts[0].replace('.service', '')
-                        if unit_name in process_map:
-                            pid = process_map[unit_name]['pid']
-                            memory = process_map[unit_name]['memory']
-                            cpu = process_map[unit_name]['cpu']
-                    
                     unit = SystemdUnit(
                         name=parts[0],
                         state="unknown",
                         load=parts[1],
                         active=parts[2],
                         sub=parts[3],
-                        description=' '.join(parts[4:]) if len(parts) > 4 else '',
-                        pid=pid,
-                        memory_bytes=memory,
-                        cpu_usage=cpu
+                        description=' '.join(parts[4:]) if len(parts) > 4 else ''
                     )
+                    
+                    if unit_type == "service":
+                        pid_cmd = ['systemctl', '--user', 'show', parts[0], '--property=MainPID', '--no-pager']
+                        pid_result = self._run_user_command(pid_cmd)
+                        if pid_result.returncode == 0 and 'MainPID=' in pid_result.stdout:
+                            pid_str = pid_result.stdout.strip().split('=')[1]
+                            if pid_str and pid_str != '0':
+                                unit.pid = int(pid_str)
+                                if str(unit.pid) in process_map:
+                                    proc_info = process_map[str(unit.pid)]
+                                    unit.memory_bytes = proc_info.get('memory')
+                                    unit.cpu_usage = proc_info.get('cpu')
+                    
                     units.append(unit)
         
         cmd_files = ['systemctl', '--user', 'list-unit-files', f'--type={unit_type}', '--no-pager', '--full']
@@ -808,12 +845,8 @@ class SystemdUserChecker:
         
         if HAS_PSUTIL and self.user_info:
             user_procs = 0
-            for proc in psutil.process_iter(['pid', 'username']):
-                try:
-                    if proc.info['username'] == self.user_info.name:
-                        user_procs += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+            process_map = self._get_user_processes()
+            user_procs = len(process_map)
             stats['user_processes'] = user_procs
         
         display_data = [
@@ -850,6 +883,16 @@ class SystemdUserChecker:
         return errors
     
     def show_service_dependencies(self, service_name: str) -> None:
+        if not service_name or '..' in service_name or '/' in service_name:
+            self._error("Invalid service name")
+            return
+        
+        check_cmd = ['systemctl', '--user', 'list-units', service_name, '--no-pager']
+        check_result = self._run_user_command(check_cmd)
+        if check_result.returncode != 0 or service_name not in check_result.stdout:
+            self._error(f"Service '{service_name}' not found")
+            return
+        
         cmd = ['systemctl', '--user', 'list-dependencies', service_name]
         result = self._run_user_command(cmd)
         
@@ -982,7 +1025,7 @@ class SystemdUserChecker:
         
         data = {
             'generated': datetime.now().isoformat(),
-            'version': '1.2.0',
+            'version': '1.2.1',
             'user_info': asdict(self.user_info) if self.user_info else None,
             'directories': [asdict(d) for d in self.directories],
             'services': [asdict(s) for s in self.services],
@@ -1009,7 +1052,7 @@ class SystemdUserChecker:
     
     def run_checks(self) -> Dict[str, Any]:
         print(f"\n{self._colorize('SYSTEMD USER PROCESS MANAGEMENT ANALYSIS', Color.BOLD + Color.CYAN)}")
-        print(f"{self._colorize('Version 1.2.0', Color.BLUE)}")
+        print(f"{self._colorize('Version 1.2.1', Color.BLUE)}")
         print(f"{self._colorize('=' * 80, Color.BOLD)}\n")
         
         self.progress.start(9, "Analyzing user systemd configuration")
@@ -1134,8 +1177,14 @@ def quiet_stderr():
     try:
         sys.stderr = open(os.devnull, 'w')
         yield
+    except Exception:
+        if sys.stderr is not original_stderr:
+            sys.stderr.close()
+        sys.stderr = original_stderr
+        raise
     finally:
-        sys.stderr.close()
+        if sys.stderr is not original_stderr:
+            sys.stderr.close()
         sys.stderr = original_stderr
 
 
